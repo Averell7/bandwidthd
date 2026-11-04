@@ -35,8 +35,8 @@ int bdconfig_wrap()
 
 %token TOKJUNK TOKSUBNET TOKNOTSUBNET TOKDEV TOKSLASH TOKSKIPINTERVALS TOKGRAPHCUTOFF TOKDESCRIPTION
 %token TOKPROMISC TOKOUTPUTCDF TOKRECOVERCDF TOKGRAPH TOKNEWLINE TOKFILTER TOKMANAGEMENTURL
-%token TOKMETAREFRESH TOKPGSQLCONNECTSTRING TOKSENSORID TOKHTDOCSDIR TOKLOGDIR TOKEXTENSIONS
-%token TOKSQLITEFILENAME
+%token TOKMETAREFRESH TOKPGSQLCONNECTSTRING TOKSENSORID TOKHTDOCSDIR TOKLOGDIR TOKEXTENSIONS TOKNAMEFILE
+%token TOKSQLITEFILENAME TOKGRAPHMAXRATE TOKGRAPHYSCALE TOKNIGHTSTART TOKNIGHTEND
 %union
 {
     int number;
@@ -65,6 +65,14 @@ command:
   |
   graph_cutoff
   |
+  graph_max_rate
+  |
+  graph_yscale
+  |
+  night_start
+  |
+  night_end
+  |
   promisc
   |
   extensions
@@ -86,6 +94,8 @@ command:
   sensor_name
   |
   htdocs_dir
+  |
+  name_file
   |
   log_dir
   |
@@ -237,6 +247,13 @@ htdocs_dir:
   }
   ;
 
+name_file:
+  TOKNAMEFILE string
+  {
+  config.name_file = $2;
+  }
+  ;
+
 log_dir:
   TOKLOGDIR string
   {
@@ -269,6 +286,41 @@ graph_cutoff:
   TOKGRAPHCUTOFF NUMBER
   {
   config.graph_cutoff = $2*1024;
+  }
+  ;
+
+graph_yscale:
+  TOKGRAPHYSCALE string
+  {
+  /* "linear" (default) or "sqrt" */
+  if (!strcmp($2, "sqrt"))
+    config.graph_yscale = YSCALE_SQRT;
+  else
+    config.graph_yscale = YSCALE_LINEAR;
+  }
+  ;
+
+night_start:
+  TOKNIGHTSTART NUMBER
+  {
+  config.night_start = $2;
+  }
+  ;
+
+night_end:
+  TOKNIGHTEND NUMBER
+  {
+  config.night_end = $2;
+  }
+  ;
+
+graph_max_rate:
+  TOKGRAPHMAXRATE NUMBER
+  {
+  /* Ceiling is given in kilobits/sec (1024-based, matching the graph axis)
+     and stored internally in bits/sec. 0 disables it (auto-scale).
+     NUMBER is an int, so cast before multiplying to survive fibre rates. */
+  config.graph_max_rate = (unsigned long long)$2 * 1024;
   }
   ;
 

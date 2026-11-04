@@ -2,6 +2,9 @@
 #include <setjmp.h>
 #include <signal.h>
 #include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <sys/stat.h>
 #include <netdb.h>
 #include <netinet/in.h>
 
@@ -9,6 +12,7 @@
 #include <sys/socket.h>
 
 #include <time.h>
+#include <math.h>
 #include "bandwidthd.h"
 
 #ifdef HAVE_ARPA_NAMESER_H
@@ -25,8 +29,127 @@ jmp_buf dnsjump;
 
 static void rdnslngjmp(int signal);
 
+// Decode a JSON string value into out[outsz], translating \uXXXX (BMP) to UTF-8
+// plus the common escapes. src must point just past the opening quote; decoding
+// stops at the closing quote. Names are emitted as UTF-8 (the HTML head now
+// declares charset=utf-8).
+static void json_decode_value(const char *src, char *out, size_t outsz)
+	{
+	size_t o = 0;
+	while (*src && *src != '"' && o < outsz - 1)
+		{
+		if (*src != '\\')
+			{
+			out[o++] = *src++;
+			continue;
+			}
+		src++; // skip the backslash
+		switch (*src)
+			{
+			case 'n':  out[o++] = '\n'; src++; break;
+			case 't':  out[o++] = '\t'; src++; break;
+			case '"':  out[o++] = '"';  src++; break;
+			case '\\': out[o++] = '\\'; src++; break;
+			case '/':  out[o++] = '/';  src++; break;
+			case 'u':
+				{
+				unsigned int cp = 0;
+				int k;
+				src++;
+				for (k = 0; k < 4 && isxdigit((unsigned char)*src); k++)
+					{
+					char c = *src++;
+					cp = cp * 16 + (c <= '9' ? c - '0' : (tolower(c) - 'a' + 10));
+					}
+				if (cp < 0x80)
+					out[o++] = cp;
+				else if (cp < 0x800)
+					{
+					if (o + 2 >= outsz) return;
+					out[o++] = 0xC0 | (cp >> 6);
+					out[o++] = 0x80 | (cp & 0x3F);
+					}
+				else
+					{
+					if (o + 3 >= outsz) return;
+					out[o++] = 0xE0 | (cp >> 12);
+					out[o++] = 0x80 | ((cp >> 6) & 0x3F);
+					out[o++] = 0x80 | (cp & 0x3F);
+					}
+				break;
+				}
+			default: out[o++] = *src++; break;
+			}
+		}
+	out[o] = '\0';
+	}
+
+// Look up an IP in the user-supplied JSON map { "ip": "name", ... }.
+// Returns TRUE and fills Buffer (size 255) on a hit. The file is cached in
+// memory and reloaded only when its mtime changes, so DHCP updates are picked
+// up without restarting. No JSON library is used: the map is a flat object, so
+// we search for the quoted key "a.b.c.d" (both quotes included, which also
+// avoids prefix collisions like 192.168.1.5 vs 192.168.1.57) and decode the
+// string value that follows the colon.
+static int LookupName(unsigned long IP, char *Buffer)
+	{
+	static char *filebuf = NULL;
+	static time_t cached_mtime = 0;
+	struct stat st;
+	char ipstr[20];
+	char token[24];
+	char *p;
+
+	if (!config.name_file || !config.name_file[0])
+		return FALSE;
+	if (stat(config.name_file, &st) != 0)
+		return FALSE;
+	if (filebuf == NULL || st.st_mtime != cached_mtime)
+		{
+		FILE *f = fopen(config.name_file, "rb");
+		char *nb;
+		size_t n;
+		if (!f)
+			return FALSE;
+		nb = malloc(st.st_size + 1);
+		if (!nb)
+			{
+			fclose(f);
+			return FALSE;
+			}
+		n = fread(nb, 1, st.st_size, f);
+		nb[n] = '\0';
+		fclose(f);
+		free(filebuf);
+		filebuf = nb;
+		cached_mtime = st.st_mtime;
+		}
+
+	HostIp2CharIp(IP, ipstr);
+	snprintf(token, sizeof(token), "\"%s\"", ipstr);
+	p = strstr(filebuf, token);
+	if (!p)
+		return FALSE;
+	p += strlen(token);
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+		p++;
+	if (*p != ':')
+		return FALSE;
+	p++;
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+		p++;
+	if (*p != '"')
+		return FALSE;
+	p++;
+	json_decode_value(p, Buffer, 255);
+	return TRUE;
+	}
+
 void rdns(char *Buffer, unsigned long IP)  // This takes over sigalarm!
 	{
+	// User-supplied name map takes precedence over reverse DNS.
+	if (LookupName(IP, Buffer))
+		return;
 #ifdef HAVE_RESOLV_H
 	char DNSError[] = "DNS Timeout: Correct to speed up graphing";
 	char None[] = "Configure DNS to reverse this IP";
@@ -145,12 +268,20 @@ void PrintTableLine(FILE *stream, struct SummaryData *Data, int Counter)
 	char Buffer6[50];
 	char Buffer7[50];
 	char Buffer8[50];
+	char NameBuf[255];
+	char NameSuffix[260];
 
 	// First convert the info to nice, human readable stuff
 	if (Data->IP == 0)
 		strcpy(Buffer1, "Total");
 	else
 		HostIp2CharIp(Data->IP, Buffer1);
+
+	// Append the friendly name (from the JSON map) when the IP is known, so it
+	// shows in the "Ip and Name" column. The Total row (IP == 0) has none.
+	NameSuffix[0] = '\0';
+	if (Data->IP != 0 && LookupName(Data->IP, NameBuf))
+		snprintf(NameSuffix, sizeof(NameSuffix), " - %s", NameBuf);
 
 	FormatNum(Data->Total,		   Buffer2,  50);
 	FormatNum(Data->TotalSent,	   Buffer3,  50);
@@ -169,10 +300,11 @@ void PrintTableLine(FILE *stream, struct SummaryData *Data, int Counter)
 		fprintf(stream, "<TR bgcolor=lightblue>");
 
 	if (Data->Graph)
-		fprintf(stream, "<TD><a href=\"#%s-%c\">%s</a></TD>%s%s%s%s%s%s%s%s%s%s</TR>\n",
+		fprintf(stream, "<TD><a href=\"#%s-%c\">%s</a>%s</TD>%s%s%s%s%s%s%s%s%s%s</TR>\n",
 			Buffer1, // Ip
 			config.tag,
 			Buffer1, // Ip
+			NameSuffix, // Name (or "")
 			Buffer2, // Total
 			Buffer3, // TotalSent
 			Buffer4, // TotalReceived
@@ -184,8 +316,9 @@ void PrintTableLine(FILE *stream, struct SummaryData *Data, int Counter)
 			Buffer7, // UDP
 			Buffer8); // ICMP
 	else
-		fprintf(stream, "<TD>%s</TD>%s%s%s%s%s%s%s%s%s%s</TR>\n",
+		fprintf(stream, "<TD>%s%s</TD>%s%s%s%s%s%s%s%s%s%s</TR>\n",
 			Buffer1, // Ip
+			NameSuffix, // Name (or "")
 			Buffer2, // Total
 			Buffer3, // TotalSent
 			Buffer4, // TotalReceived
@@ -249,6 +382,7 @@ void MakeIndexPages(int NumIps, struct SummaryData *SummaryData[])
 	
 	fprintf(file, "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\">\n");
 	fprintf(file, "<HTML>\n<HEAD>\n<TITLE>Bandwidthd</TITLE>\n");
+	fprintf(file, "<META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=utf-8\">\n");
 
 	if (config.meta_refresh)
 		fprintf(file, "<META HTTP-EQUIV=\"REFRESH\" content=\"%u\">\n",
@@ -320,6 +454,7 @@ void MakeIndexPages(int NumIps, struct SummaryData *SummaryData[])
 			}
 		fprintf(file, "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\">\n");
 		fprintf(file, "<HTML>\n<HEAD><TITLE>Bandwidthd - Subnet %s</TITLE>\n", Buffer1);
+		fprintf(file, "<META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=utf-8\">\n");
 
 		if (config.meta_refresh)
 			fprintf(file, "<META HTTP-EQUIV=\"REFRESH\" content=\"%u\">\n",
@@ -382,12 +517,75 @@ void MakeIndexPages(int NumIps, struct SummaryData *SummaryData[])
 	free(SummaryData);
 	}
 
+// Shade the night period with a light grey background band, as a visual aid to
+// locate the time of day. Drawn before the data bars (so the bars sit on top)
+// and gated to graphs where a day is wide enough to be legible, otherwise the
+// long-range graph would just get smeared an even grey. config.night_start and
+// config.night_end are hours [0..23]; start == end disables it (the default).
+void PrepareNightShade(gdImagePtr im, time_t timestamp)
+	{
+	time_t sample_begin;
+	struct tm *timestruct;
+	long int MarkTime;
+	double x1, x2;
+	int nightshade;
+	int ns, ne;
+
+	ns = config.night_start;
+	ne = config.night_end;
+	if (ns == ne || ns < 0 || ns > 23 || ne < 0 || ne > 23)
+		return;	// disabled or out of range
+
+	// Skip when a day is too narrow for the band to be meaningful.
+	if ((24L*60*60*(XWIDTH-XOFFSET))/config.range < 20)
+		return;
+
+	sample_begin = timestamp - config.range;
+
+	// Allocated after the caller's white background, so white stays the palette
+	// background colour.
+	nightshade = gdImageColorAllocate(im, 235, 235, 235);
+
+	// Start one day before the left edge, so a night that began off-screen still
+	// gets its visible remainder shaded.
+	timestruct = localtime((time_t *)&sample_begin);
+	timestruct->tm_sec = 0;
+	timestruct->tm_min = 0;
+	timestruct->tm_hour = 0;
+	MarkTime = mktime(timestruct) - (24*60*60);
+
+	while (1)
+		{
+		time_t nstart, nend;
+
+		nstart = MarkTime + ns*60*60;
+		if (ns < ne)
+			nend = MarkTime + ne*60*60;			// same-day night (no midnight wrap)
+		else
+			nend = MarkTime + (24 + ne)*60*60;	// wraps past midnight (e.g. 19h -> 7h)
+
+		x1 = (nstart - sample_begin)*((double)(XWIDTH-XOFFSET)/config.range) + XOFFSET;
+		x2 = (nend   - sample_begin)*((double)(XWIDTH-XOFFSET)/config.range) + XOFFSET;
+
+		if (x1 < XOFFSET)
+			x1 = XOFFSET;
+		if (x2 > XWIDTH-1)
+			x2 = XWIDTH-1;
+		if (x2 > x1 && x1 < XWIDTH)
+			gdImageFilledRectangle(im, (int)x1, 0, (int)x2, YHEIGHT-YOFFSET, nightshade);
+
+		MarkTime += (24*60*60);
+		if ((MarkTime - sample_begin)*((double)(XWIDTH-XOFFSET)/config.range) + XOFFSET > XWIDTH)
+			break;
+		}
+	}
+
 void GraphIp(struct IPDataStore *DataStore, struct SummaryData *SummaryData, time_t timestamp)
 	{
 	FILE *OutputFile;
 	char filename[MAX_FILENAME];
 	gdImagePtr im, im2;
-	int white;
+	int white __attribute__((unused));
 	unsigned long long int YMax;
 	char CharIp[20];
 
@@ -409,6 +607,10 @@ void GraphIp(struct IPDataStore *DataStore, struct SummaryData *SummaryData, tim
 	im2 = gdImageCreate(XWIDTH, YHEIGHT);
 	white = gdImageColorAllocate(im2, 255, 255, 255);
 	//gdImageFill(im2, 10, 10, white);
+
+	// Night-time background shading, drawn first so the data bars sit on top.
+	PrepareNightShade(im, timestamp);
+	PrepareNightShade(im2, timestamp);
 
 	YMax = GraphData(im, im2, DataStore, GraphBeginTime, SummaryData);
 	if (YMax != 0)
@@ -452,6 +654,25 @@ void GraphIp(struct IPDataStore *DataStore, struct SummaryData *SummaryData, tim
 	}
 
 // Returns YMax
+// Map a traffic rate (bytes/sec) to a pixel height using the configured
+// vertical scale. Any value >= ymax is clipped to the full plot height, so a
+// clamped YMax (graph_max_rate) can never cause an unsigned underflow when the
+// caller computes "(YHEIGHT-YOFFSET) - value". sqrt mode lifts low/background
+// traffic so that brief spikes no longer flatten the rest of the graph.
+// Cumulative stack boundaries must be summed in rate units BEFORE calling this,
+// because sqrt(a)+sqrt(b) != sqrt(a+b).
+static unsigned long long ScaleY(unsigned long long v, unsigned long long ymax)
+{
+	unsigned long long h = (YHEIGHT - YOFFSET);
+	if (ymax == 0)
+		return 0;
+	if (v >= ymax)
+		return h;
+	if (config.graph_yscale == YSCALE_SQRT)
+		return (unsigned long long)(h * sqrt((double)v / (double)ymax));
+	return (v * h) / ymax;   // linear (original behaviour, byte-for-byte)
+}
+
 unsigned long long int GraphData(gdImagePtr im, gdImagePtr im2, struct IPDataStore *DataStore, time_t timestamp, struct SummaryData *SummaryData)
 	{
 	unsigned long long int YMax=0;
@@ -509,7 +730,7 @@ unsigned long long int GraphData(gdImagePtr im, gdImagePtr im2, struct IPDataSto
 	green2	 = gdImageColorAllocate(im2, 0, 255, 0);
 	blue2	 = gdImageColorAllocate(im2, 0, 0, 255);
 	lblue2	 = gdImageColorAllocate(im2, 128, 128, 255);
-	orange2  = gdImageColorAllocate(im2, 255, 128, 0);
+	orange2  = gdImageColorAllocate(im2, 255, 128, 0); (void)orange2;
 	brown2	 = gdImageColorAllocate(im2, 128, 0, 0);
 	red2	 = gdImageColorAllocate(im2, 255, 0, 0);
 	black2	 = gdImageColorAllocate(im2, 0, 0, 0);
@@ -638,6 +859,19 @@ unsigned long long int GraphData(gdImagePtr im, gdImagePtr im2, struct IPDataSto
 			}
 
 	YMax += YMax*0.05;	  // Add an extra 5%
+
+	// Optional fixed ceiling shared by every graph. When graph_max_rate is set,
+	// clamp the auto-scaled maximum so brief high-bandwidth spikes no longer
+	// flatten normal traffic, and so all graphs use the same vertical scale.
+	// graph_max_rate is in bits/sec; YMax is in bytes/sec, hence the /8.
+	// 0 keeps the original per-graph auto-scaling. Spikes above the ceiling
+	// are clipped at the top of the plot (see the CLIP_Y block below).
+	if (config.graph_max_rate)
+		{
+		unsigned long long YCeiling = config.graph_max_rate / 8;
+		if (YCeiling > 0 && YMax > YCeiling)
+			YMax = YCeiling;
+		}
 	
 	if ((SummaryData->IP != 0 && SummaryData->Total < config.graph_cutoff))
 		{
@@ -652,45 +886,33 @@ unsigned long long int GraphData(gdImagePtr im, gdImagePtr im2, struct IPDataSto
 			{
 			if (Count[Counter] > 0)
 				{
-				// Convert the bytes/sec to y coords
-				total[Counter] = (total[Counter]*(YHEIGHT-YOFFSET))/YMax;
-				tcp[Counter] = (tcp[Counter]*(YHEIGHT-YOFFSET))/YMax;
-				ftp[Counter] = (ftp[Counter]*(YHEIGHT-YOFFSET))/YMax;
-				http[Counter] = (http[Counter]*(YHEIGHT-YOFFSET))/YMax;
-				mail[Counter] = (mail[Counter]*(YHEIGHT-YOFFSET))/YMax;
-				p2p[Counter] = (p2p[Counter]*(YHEIGHT-YOFFSET))/YMax;
-				udp[Counter] = (udp[Counter]*(YHEIGHT-YOFFSET))/YMax;
-				icmp[Counter] = (icmp[Counter]*(YHEIGHT-YOFFSET))/YMax;
+				// Build the cumulative stack boundaries in rate units FIRST,
+				// then map to pixels. Ordering matters for non-linear scales:
+				// sqrt(a)+sqrt(b) != sqrt(a+b), so the stack must be summed
+				// before ScaleY() is applied, not after.
+				//
+				// Stack 'em up! (still bytes/sec here)
+				// Icmp on the bottom; Udp on icmp; Tcp and p2p on udp;
+				// Http on p2p; Mail on http; Ftp on mail.
+				udp[Counter] += icmp[Counter];      udp2[Counter] += icmp2[Counter];
+				tcp[Counter] += udp[Counter];       tcp2[Counter] += udp2[Counter];
+				p2p[Counter] += udp[Counter];       p2p2[Counter] += udp2[Counter];
+				http[Counter] += p2p[Counter];      http2[Counter] += p2p2[Counter];
+				mail[Counter] += http[Counter];     mail2[Counter] += http2[Counter];
+				ftp[Counter] += mail[Counter];      ftp2[Counter] += mail2[Counter];
 
-				total2[Counter] = (total2[Counter]*(YHEIGHT-YOFFSET))/YMax;
-				tcp2[Counter] = (tcp2[Counter]*(YHEIGHT-YOFFSET))/YMax;
-				ftp2[Counter] = (ftp2[Counter]*(YHEIGHT-YOFFSET))/YMax;
-				http2[Counter] = (http2[Counter]*(YHEIGHT-YOFFSET))/YMax;
-				mail2[Counter] = (mail2[Counter]*(YHEIGHT-YOFFSET))/YMax;
-				p2p2[Counter] = (p2p2[Counter]*(YHEIGHT-YOFFSET))/YMax;
-				udp2[Counter] = (udp2[Counter]*(YHEIGHT-YOFFSET))/YMax;
-				icmp2[Counter] = (icmp2[Counter]*(YHEIGHT-YOFFSET))/YMax;
+				// Map each boundary (and the standalone total envelope) to y
+				// coords through the configured scale. ScaleY() also clips, so
+				// no separate clip pass is needed.
+				total[Counter] = ScaleY(total[Counter], YMax);  total2[Counter] = ScaleY(total2[Counter], YMax);
+				icmp[Counter]  = ScaleY(icmp[Counter],  YMax);  icmp2[Counter]  = ScaleY(icmp2[Counter],  YMax);
+				udp[Counter]   = ScaleY(udp[Counter],   YMax);  udp2[Counter]   = ScaleY(udp2[Counter],   YMax);
+				tcp[Counter]   = ScaleY(tcp[Counter],   YMax);  tcp2[Counter]   = ScaleY(tcp2[Counter],   YMax);
+				p2p[Counter]   = ScaleY(p2p[Counter],   YMax);  p2p2[Counter]   = ScaleY(p2p2[Counter],   YMax);
+				http[Counter]  = ScaleY(http[Counter],  YMax);  http2[Counter]  = ScaleY(http2[Counter],  YMax);
+				mail[Counter]  = ScaleY(mail[Counter],  YMax);  mail2[Counter]  = ScaleY(mail2[Counter],  YMax);
+				ftp[Counter]   = ScaleY(ftp[Counter],   YMax);  ftp2[Counter]   = ScaleY(ftp2[Counter],   YMax);
 
-				// Stack 'em up!
-				// Total is stacked from the bottom
-				// Icmp is on the bottom too
-				// Udp is stacked on top of icmp
-				udp[Counter] += icmp[Counter];
-				udp2[Counter] += icmp2[Counter];
-				// TCP and p2p are stacked on top of Udp
-				tcp[Counter] += udp[Counter];
-				tcp2[Counter] += udp2[Counter];
-				p2p[Counter] += udp[Counter];
-				p2p2[Counter] += udp2[Counter];
-				// Http is stacked on top of p2p
-				http[Counter] += p2p[Counter];
-				http2[Counter] += p2p2[Counter];
-				// Mail is stacked on top of http
-				mail[Counter] += http[Counter];
-				mail2[Counter] += http2[Counter];				
-				// Ftp is stacked on top of mail
-				ftp[Counter] += mail[Counter];
-				ftp2[Counter] += mail2[Counter];
 
 				// Plot them!
 				// Sent
@@ -788,7 +1010,13 @@ void PrepareYAxis(gdImagePtr im, unsigned long long int YMax)
 
 	while (YTic < (YMax - YMax/10))
 		{
-		y = (YHEIGHT-YOFFSET)-((YTic*(YHEIGHT-YOFFSET))/YMax);		  
+		// Position the tick by the same scale used for the bars, so the
+		// labels stay truthful in sqrt mode (label values themselves are
+		// unchanged; only their vertical position bends).
+		if (config.graph_yscale == YSCALE_SQRT)
+			y = (YHEIGHT-YOFFSET) - ((YHEIGHT-YOFFSET) * sqrt((double)YTic / (double)YMax));
+		else
+			y = (YHEIGHT-YOFFSET)-((YTic*(YHEIGHT-YOFFSET))/YMax);		  
 
 		gdImageLine(im, XOFFSET, y, XWIDTH, y, black);		  
 		snprintf(buffer, 20, "%4.1f %cbits/s", (float)(8.0*YTic)/Divisor, YLegend);
@@ -802,14 +1030,13 @@ void PrepareXAxis(gdImagePtr im, time_t timestamp)
 	{
 	char buffer[100];
 	int black, red;
-	time_t sample_begin, sample_end;	
+	time_t sample_begin;
 	struct tm *timestruct;
 	long int MarkTime;
 	long int MarkTimeStep;
 	double x;
 	
 	sample_begin=timestamp-config.range;
-	sample_end=sample_begin+config.interval;
 
 	black = gdImageColorAllocate(im, 0, 0, 0);
 	red   = gdImageColorAllocate(im, 255, 0, 0);
@@ -914,8 +1141,13 @@ void PrepareXAxis(gdImagePtr im, time_t timestamp)
 	while (x < (XWIDTH-10))
 		{
 		if (x > XOFFSET) {
-			gdImageLine(im, x, YHEIGHT-YOFFSET-5, x, YHEIGHT-YOFFSET+5, black);
-			gdImageLine(im, x+1, YHEIGHT-YOFFSET-5, x+1, YHEIGHT-YOFFSET+5, black);
+			// 6-hour marks: keep a short stub above the baseline (visible when
+			// there is no traffic) but extend the part BELOW the baseline, where
+			// the colored traffic bars never reach. The hourly minor ticks stay
+			// short (+5 below), so these longer downstrokes remain easy to pick
+			// out and the 6-hour rhythm is readable even under heavy traffic.
+			gdImageLine(im, x, YHEIGHT-YOFFSET-5, x, YHEIGHT-YOFFSET+9, black);
+			gdImageLine(im, x+1, YHEIGHT-YOFFSET-5, x+1, YHEIGHT-YOFFSET+9, black);
 			}
 		MarkTime += MarkTimeStep;
 		x = (MarkTime-sample_begin)*((XWIDTH-XOFFSET)/config.range) + XOFFSET;

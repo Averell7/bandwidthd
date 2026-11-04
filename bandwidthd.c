@@ -93,6 +93,7 @@ void bd_CollectingData()
 			{
 			fprintf(index, "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\">\n");
 			fprintf(index, "<HTML><HEAD><TITLE>Bandwidthd</TITLE>\n");
+			fprintf(index, "<META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=utf-8\">\n");
 			if (config.meta_refresh)
 				fprintf(index, "<META HTTP-EQUIV=\"REFRESH\" content=\"%u\">\n",
 						config.meta_refresh);
@@ -299,6 +300,10 @@ int main(int argc, char **argv)
 	//config.filter = "ip";
 	config.skip_intervals = CONFIG_GRAPHINTERVALS;
 	config.graph_cutoff = CONFIG_GRAPHCUTOFF;
+	config.graph_max_rate = CONFIG_GRAPHMAXRATE;
+	config.graph_yscale = CONFIG_GRAPHYSCALE;
+	config.night_start = CONFIG_NIGHTSTART;
+	config.night_end = CONFIG_NIGHTEND;
 	config.promisc = TRUE;
 	config.extensions = FALSE;
 	config.graph = TRUE;
@@ -310,6 +315,7 @@ int main(int argc, char **argv)
 	config.sensor_name = "unset";  
 	config.log_dir = LOG_DIR;
 	config.htdocs_dir = HTDOCS_DIR;
+	config.name_file = NULL;
 	openlog("bandwidthd", LOG_CONS, LOG_DAEMON);
 	// Locate configuration file
 	if (!(bd_conf && !stat(bd_conf, &StatBuf)))
@@ -329,11 +335,16 @@ int main(int argc, char **argv)
 					if (!stat(CONFIG_FILE, &StatBuf))
 						bd_conf = CONFIG_FILE;
 					else
-						{
-						printf("Cannot find bandwidthd.conf, ./etc/bandwidthd.conf or %s\n", CONFIG_FILE);
-						syslog(LOG_ERR, "Cannot find bandwidthd.conf, ./etc/bandwidthd.conf or %s", CONFIG_FILE);
-						exit(1);
-						}
+						// Also look in the distro location, so this build can
+						// drop in for a packaged bandwidthd without moving the file.
+						if (!stat("/etc/bandwidthd/bandwidthd.conf", &StatBuf))
+							bd_conf = "/etc/bandwidthd/bandwidthd.conf";
+						else
+							{
+							printf("Cannot find bandwidthd.conf, ./etc/bandwidthd.conf, %s or /etc/bandwidthd/bandwidthd.conf\n", CONFIG_FILE);
+							syslog(LOG_ERR, "Cannot find bandwidthd.conf, ./etc/bandwidthd.conf, %s or /etc/bandwidthd/bandwidthd.conf", CONFIG_FILE);
+							exit(1);
+							}
 		}
 	bdconfig_in = fopen(bd_conf, "rt");
 	if (!bdconfig_in)
@@ -610,7 +621,7 @@ void PacketCallback(u_char *user, const struct pcap_pkthdr *h, const u_char *p)
 	int AlreadyTotaled = FALSE;
 	PacketCallbackLock = TRUE;
 	eptr = (struct ether_header *) p;
-	vlanhdr = (struct vlanhdr *) p;
+	vlanhdr = (struct VlanHeader *) p;
 	if (eptr->ether_type == htons(1537))
 		ParseBroadcast(p);
 	if (vlanhdr->ether_type[0]==0x81 && vlanhdr->ether_type[1]==0x00) //Two byte-wise checks instead of 1 word-wise check to avoid word boundary issues on some intel processors
@@ -883,14 +894,18 @@ void StoreIPDataInCDF(struct IPData IncData[])
 	char logfile[MAX_FILENAME];
 	snprintf(logfile, MAX_FILENAME, "%s/log.%c.0.cdf", config.log_dir, config.tag);
 	cdf = fopen(logfile, "at");
-	if (!cdf) return;
+	if (!cdf)	// log_dir missing or not writable: warn and bail rather than deref NULL
+		{
+		syslog(LOG_ERR, "Cannot open %s for writing CDF data", logfile);
+		return;
+		}
 	for (Counter=0; Counter < IpCount; Counter++)
 		{
 		IPData = &IncData[Counter];
 		HostIp2CharIp(IPData->ip, IPBuffer);
 		fprintf(cdf, "%s,%lu,", IPBuffer, IPData->timestamp);
 		Stats = &(IPData->Send);
-		fprintf(cdf, "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu", Stats->total, Stats->icmp, Stats->udp, Stats->tcp, Stats->ftp, Stats->http, Stats->mail, Stats->p2p); 
+		fprintf(cdf, "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,", Stats->total, Stats->icmp, Stats->udp, Stats->tcp, Stats->ftp, Stats->http, Stats->mail, Stats->p2p); 
 		Stats = &(IPData->Receive);
 		fprintf(cdf, "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", Stats->total, Stats->icmp, Stats->udp, Stats->tcp, Stats->ftp, Stats->http, Stats->mail, Stats->p2p); 
 		}
@@ -1033,7 +1048,11 @@ void CommitData(time_t timestamp)
 			logname2[offset] = '1';
 			if (!stat(logname1, &StatBuf)) // File exists
 				rename(logname1, logname2); 
-			fclose(fopen(logname1, "at")); // Touch file
+			{ // Touch file (guard against fopen failure: fclose(NULL) crashes)
+			FILE *touch = fopen(logname1, "at");
+			if (touch)
+				fclose(touch);
+			}
 			RotateLogs = FALSE;
 			}
 		}
@@ -1149,10 +1168,10 @@ void RCDF_Load(FILE *cdf)
 		ip->timestamp = timestamp;
 		if (fscanf(cdf, "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,",
 			&ip->Send.total, &ip->Send.icmp, &ip->Send.udp,
-			&ip->Send.tcp, &ip->Send.ftp, &ip->Send.http, &ip->Send.mail, &ip->Send.p2p) != 7
+			&ip->Send.tcp, &ip->Send.ftp, &ip->Send.http, &ip->Send.mail, &ip->Send.p2p) != 8
 		  || fscanf(cdf, "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu",
 			&ip->Receive.total, &ip->Receive.icmp, &ip->Receive.udp,
-			&ip->Receive.tcp, &ip->Receive.ftp, &ip->Receive.http, &ip->Receive.mail, &ip->Receive.p2p) != 7)
+			&ip->Receive.tcp, &ip->Receive.ftp, &ip->Receive.http, &ip->Receive.mail, &ip->Receive.p2p) != 8)
 			goto End_RecoverDataFromCdf;
 		}
 End_RecoverDataFromCdf:

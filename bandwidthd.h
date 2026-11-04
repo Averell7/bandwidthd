@@ -94,6 +94,12 @@ typedef u_int16_t uint16_t;
 #define CONFIG_GRAPHINTERVALS 1    // 2 -5 Number of Intervals to wait before redrawing the graphs
 
 #define CONFIG_GRAPHCUTOFF 1024*1024	// If total data transfered doesn't reach at least this number we don't graph the ip
+#define CONFIG_GRAPHMAXRATE 0	// Fixed vertical ceiling in bits/sec shared by every graph. 0 = auto-scale (original behaviour)
+#define YSCALE_LINEAR 0	// Vertical axis scale: linear (original behaviour)
+#define YSCALE_SQRT   1	// Vertical axis scale: square-root (lifts low traffic so spikes do not flatten it)
+#define CONFIG_GRAPHYSCALE YSCALE_LINEAR
+#define CONFIG_NIGHTSTART 0	// Night-shade start hour [0..23]; start==end disables it (default off)
+#define CONFIG_NIGHTEND 0	// Night-shade end hour [0..23]
 
 #define LEAD .05	// % Of time to lead the graph
 
@@ -116,6 +122,10 @@ struct config
 	char *filter;
 	unsigned int skip_intervals;
 	unsigned long long graph_cutoff;
+	unsigned long long graph_max_rate;	// Fixed vertical ceiling in bits/sec, 0 = auto-scale
+	int graph_yscale;	// YSCALE_LINEAR or YSCALE_SQRT
+	int night_start;	// Night-shade start hour [0..23], start==end = off
+	int night_end;		// Night-shade end hour [0..23]
 	int promisc;
 	int extensions;
 	int output_cdf;
@@ -132,6 +142,7 @@ struct config
 	char *htdocs_dir;
 	char *description;
 	char *management_url;
+	char *name_file;	// Path to JSON { "ip": "name" } map, NULL = off (DNS only)
 	};
 
 struct SubnetData
@@ -158,7 +169,7 @@ struct Statistics
 struct IPData
 	{
 	time_t timestamp;
-	char *mac[1][20];
+	char mac[1][20];
 	uint32_t ip;	// Host byte order
 	struct Statistics Send;
 	struct Statistics Receive;
@@ -238,6 +249,7 @@ void RecoverDataFromCDF(void);
 
 // ************ Adds subnets to the list of subnets that are monitored
 void MonitorSubnet(unsigned int ip, unsigned int mask);
+void IgnoreMonitorSubnet(unsigned int ip, unsigned int mask);
 
 
 // ************ This function converts and IP to a char string
@@ -258,6 +270,7 @@ void			CommitData(time_t timestamp);
 // ************ Creates our Graphs
 void			GraphIp(struct IPDataStore *DataStore, struct SummaryData *SummaryData, time_t timestamp);
 void			PrepareXAxis(gdImagePtr im, time_t timestamp);
+void			PrepareNightShade(gdImagePtr im, time_t timestamp);
 void			PrepareYAxis(gdImagePtr im, unsigned long long int YMax);
 unsigned long long GraphData(gdImagePtr im, gdImagePtr im2, struct IPDataStore *DataStore, time_t timestamp,  struct SummaryData *SummaryData);
 
